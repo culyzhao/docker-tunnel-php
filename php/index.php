@@ -18,6 +18,12 @@ $requestUri = $_SERVER['REQUEST_URI'];
 $host = $_SERVER['HTTP_HOST'];
 $scheme = $_SERVER['REQUEST_SCHEME'] ?? ($_SERVER['HTTPS'] === 'on' ? 'https' : 'http');
 
+if($requestUri === '/testing') {
+    header('content-type: text/plain');
+    echo 'docker ok!';
+    exit();
+}
+
 #you can set up 'localBase' use other method, e.g. http header
 $localBase = $scheme . '://' . $host;
 
