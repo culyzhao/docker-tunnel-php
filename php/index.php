@@ -1,88 +1,109 @@
 <?php
 use Jazor\Http\Request;
 use Jazor\Uri;
-include_once __DIR__ . '/./vendor/autoload.php';
-include_once __DIR__ . '/./helper.php';
+
+include_once __DIR__ . '/vendor/autoload.php';
+include_once __DIR__ . '/helper.php';
 
 const HUB_HOST = 'registry-1.docker.io';
 const AUTH_HOST = 'auth.docker.io';
 const AUTH_BASE = 'https://auth.docker.io';
-const TUNNEL_PROXY_START= '/TUNNEL_PROXY_START/';
+const TUNNEL_PROXY_START = '/TUNNEL_PROXY_START/';
+
+set_time_limit(0);
+ob_implicit_flush(true);
 
 $headers = get_request_headers();
 unset($headers['Host']);
-unset($headers['Accept-Encoding']);
+unset($headers['Accept-Encoding']); // 禁止 gzip 压缩防止转发异常
 
 $method = $_SERVER['REQUEST_METHOD'];
 $requestUri = $_SERVER['REQUEST_URI'];
 $host = $_SERVER['HTTP_HOST'];
-$scheme = $_SERVER['REQUEST_SCHEME'] ?? ($_SERVER['HTTPS'] === 'on' ? 'https' : 'http');
+$scheme = $_SERVER['REQUEST_SCHEME'] ?? ((isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on') ? 'https' : 'http');
 
-if($requestUri === '/testing') {
+if ($requestUri === '/testing') {
     header('content-type: text/plain');
-    echo 'docker ok!';
+    echo "docker proxy ok!\n";
     exit();
 }
 
-#you can set up 'localBase' use other method, e.g. http header
+# local base, 用于重写 token 地址
 $localBase = $scheme . '://' . $host;
 
-#ensure host to connect
-$newHost = strpos($requestUri, '/token?') === 0 ? AUTH_HOST : HUB_HOST;
+# 决定代理的上游主机
+$newHost = (strpos($requestUri, '/token?') === 0) ? AUTH_HOST : HUB_HOST;
 
-#inner proxy setup
+# 如果是内部隧道代理
 if (strpos($requestUri, TUNNEL_PROXY_START) === 0) {
-    $url = urldecode(substr($requestUri, 20));
+    $url = urldecode(substr($requestUri, strlen(TUNNEL_PROXY_START)));
 
-    #block proxy, just proxy for docker.com
+    # 安全检查，只允许 docker.com 相关域名
     $hostName = (new Uri($url))->getAuthority();
-    if (strpos($hostName, '.docker.com') !== strlen($hostName) - 11) exit();
+    if (strpos($hostName, '.docker.com') !== strlen($hostName) - 11) {
+        header('HTTP/1.1 403 Forbidden');
+        echo "Forbidden external domain\n";
+        exit();
+    }
     $newUri = $url;
-}else{
-    #get uri for proxy
+} else {
     $newUri = 'https://' . $newHost . $requestUri;
 }
 
-#start proxy
+# 构造请求
 $req = new Request($newUri, $method);
-
-foreach ($headers as $name => $value) $req->setHeader($name, $value);
-
+foreach ($headers as $name => $value) {
+    $req->setHeader($name, $value);
+}
 $req->setHeader('Connection', 'close');
 
-#ignore ssl error
-$response = $req->getResponse(['sslVerifyPeer' => false, 'sslVerifyHost' => false]);
+# 获取响应
+$response = $req->getResponse([
+    'sslVerifyPeer' => false,
+    'sslVerifyHost' => false,
+]);
 
-$headers = $response->getHeaders();
-
-#passthrough status code
+# 输出状态码
 header('HTTP/1.1 ' . $response->getStatusCode() . ' ' . $response->getStatusText());
 
+# 转发常用头部
 $contentType = $response->getContentType();
 if ($contentType) send_header('Content-Type', $contentType);
-
-#redirect authentication
-$auth = $response->getSingletHeader("Www-Authenticate");
-if ($auth) send_header("Www-Authenticate", str_replace(AUTH_BASE, $localBase, $auth));
-
-#redirect location with inner proxy
-$location = $response->getLocation();
-if ($location) {
-    $uri = new Uri($location);
-    if($uri->isFullUrl()) $location = TUNNEL_PROXY_START . urlencode($location);
-    send_header('Location', $localBase . $location);
-}
 
 $contentLength = $response->getContentLength();
 if ($contentLength >= 0) send_header('Content-Length', $contentLength);
 
+# 修改认证地址
+$auth = $response->getSingletHeader('Www-Authenticate');
+if ($auth) {
+    $auth = str_replace(AUTH_BASE, $localBase, $auth);
+    send_header('Www-Authenticate', $auth);
+}
+
+# 处理 Location 重定向逻辑
+$location = $response->getLocation();
+if ($location) {
+    $uri = new Uri($location);
+
+    // ✅ 对 Docker Hub / Token 地址重写为本地
+    if (strpos($location, AUTH_BASE) === 0 || strpos($location, HUB_HOST) !== false) {
+        $location = str_replace(AUTH_BASE, $localBase, $location);
+        $location = str_replace('https://' . HUB_HOST, $localBase, $location);
+        send_header('Location', $location);
+    } else {
+        // ✅ 对 CDN 地址（如 Cloudflare、AWS）保持原样，客户端直连
+        send_header('Location', $location);
+    }
+}
+
+# HEAD 请求不带 body
 if ($contentLength === 0 || $method === 'HEAD') exit();
 
-#sink to php://output
+# 对于有明确长度的响应
 if ($contentLength > 0) {
     $response->sink('php://output');
     exit();
 }
 
-#send response body to client
+# 否则直接输出响应体
 echo $response->getBody();
